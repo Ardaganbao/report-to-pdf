@@ -1,0 +1,51 @@
+%!PS
+% add page numbers document bottom right (20 units spacing , harcoded below)
+% Note: Page dimensions are expressed in units of the default user space (72nds of an inch).
+% inspired by https://www.ghostscript.com/pipermail/gs-devel/2005-May/006956.html
+
+globaldict /MyPageCount 1 put % initialize page counter
+
+% executed at the end of each page. Before calling the procedure, the interpreter
+% pushes two integers on the operand stack:
+% 1. a count of previous showpage executions for this device
+% 2. a reason code indicating the circumstances under which this call is being made:
+%    0: During showpage or (LanguageLevel 3) copypage
+%    1: During copypage (LanguageLevel 2 only)
+%    2: At device deactivation
+% The procedure must return a boolean value specifying whether to transmit the page image to the
+% physical output device.
+
+ /concatstrings % (a) (b) -> (ab)  
+   { exch dup length    
+     2 index length add string    
+     dup dup 4 2 roll copy length
+     4 -1 roll putinterval
+   } bind def 
+   
+
+/linkingword ( of ) def
+
+ 
+/TotalPage where {
+  /TotalPage get  
+} 
+
+<< /EndPage {
+  exch pop % remove showpage counter (unused)
+  0 eq dup { % only run and return true for showpage
+    MyPageCount 1 gt {
+      /Helvetica 9 selectfont % select font and size for following operations
+
+      MyPageCount =string cvs % get page counter as string
+      linkingword concatstrings
+      TotalPage concatstrings
+      dup % need it twice (width determination and actual show)
+      stringwidth pop % get width of page counter string ...
+      currentpagedevice /PageSize get 0 get % get width from PageSize on stack
+      exch sub 20 sub % pagewidth - stringwidth - some extra space
+      20 moveto % move to calculated x and y=20 (0/0 is the bottom left corner)
+      show % finally show the page counter
+    } if
+    globaldict /MyPageCount MyPageCount 1 add put % increment page counter
+  } if
+} bind >> setpagedevice

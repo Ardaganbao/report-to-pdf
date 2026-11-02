@@ -1,0 +1,3 @@
+# Report HTML and PDFs fetched at run time, and machine logs.
+temp_pdf/
+*.log
