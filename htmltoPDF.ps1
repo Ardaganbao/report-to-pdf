@@ -37,6 +37,99 @@ if (-not $ghostscriptPath) {
 if (-not $ghostscriptPath) {
   throw 'gswin64c.exe was not found. Run install.ps1 as administrator first.'
 }
+
+# wkhtmltopdf cannot run Chart.js 4 (its WebKit is too old), so headless Chrome or Edge opens the page
+# first and every ``` graph block drawn by view.js is replaced by a picture of its chart.
+function Add-GraphImages {
+  param ([string]$Html, [string]$WorkFolder)
+
+  if ($Html -notmatch 'id=["'']ardareport-graphs-js["'']') {
+    return $Html
+  }
+  $browserPath = @(
+    (Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe')
+    (Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe')
+    (Join-Path $env:LOCALAPPDATA 'Google\Chrome\Application\chrome.exe')
+    (Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe')
+    (Join-Path $env:ProgramFiles 'Microsoft\Edge\Application\msedge.exe')
+  ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+  if (-not $browserPath) {
+    Write-Warning 'Chrome or Edge was not found: the graphs stay as text in the PDF.'
+    return $Html
+  }
+  $bodyEnd = $Html.LastIndexOf('</body>', [StringComparison]::OrdinalIgnoreCase)
+  if ($bodyEnd -lt 0) {
+    return $Html
+  }
+
+  # Once view.js has drawn the graphs, copy each block with its canvases turned into PNG images.
+  $collector = @'
+<script>
+window.addEventListener('load', function () {
+  var blocks = document.querySelectorAll('[data-ardareport-graph]'), graphs = [];
+  for (var i = 0; i < blocks.length; i++) {
+    if (blocks[i].getAttribute('data-ardareport-graph') === 'Ardagram') {
+      continue;
+    }
+    var container = blocks[i].parentNode.tagName === 'PRE' ? blocks[i].parentNode : blocks[i];
+    var copy = container.cloneNode(true), canvases = container.getElementsByTagName('canvas'), copies = copy.getElementsByTagName('canvas');
+    for (var j = canvases.length - 1; j >= 0; j--) {
+      var image = document.createElement('img');
+      image.src = canvases[j].toDataURL('image/png');
+      image.alt = canvases[j].getAttribute('aria-label') || '';
+      image.style.cssText = canvases[j].style.cssText;
+      copies[j].parentNode.replaceChild(image, copies[j]);
+    }
+    graphs.push(copy.outerHTML);
+  }
+  var output = document.createElement('pre');
+  output.id = 'ardareport-graph-images';
+  output.textContent = graphs.join('<!--ardareport-graph-->');
+  document.body.appendChild(output);
+});
+</script>
+'@
+  $sourceFile = Join-Path $WorkFolder 'graphs.html'
+  $dumpFile = Join-Path $WorkFolder 'graphs-dump.html'
+  Set-Content -LiteralPath $sourceFile -Value $Html.Insert($bodyEnd, $collector) -Encoding UTF8
+
+  # A short profile path: the browser's cache folders are deep and break the 260 characters limit.
+  $profileFolder = Join-Path $env:TEMP ('report-to-pdf-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+  $browserArguments = '--headless', '--disable-gpu', '--no-first-run', '--no-default-browser-check', "--user-data-dir=`"$profileFolder`"", '--virtual-time-budget=10000', '--dump-dom', "`"$sourceFile`""
+  $browser = Start-Process -NoNewWindow -PassThru -FilePath $browserPath -ArgumentList $browserArguments -RedirectStandardOutput $dumpFile -RedirectStandardError (Join-Path $WorkFolder 'graphs.log')
+  # Edge waits forever when a policy forces the sign-in.
+  if (-not $browser.WaitForExit(30000)) {
+    & taskkill.exe /T /F /PID $browser.Id | Out-Null
+    # The killed processes free the profile files a moment later.
+    Start-Sleep -Seconds 2
+  }
+  Remove-Item -LiteralPath $profileFolder -Recurse -Force -ErrorAction SilentlyContinue
+
+  $dump = [string](Get-Content -LiteralPath $dumpFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue)
+  $output = [regex]::Match($dump, '<pre id="ardareport-graph-images">([\s\S]*?)</pre>')
+  if (-not $output.Success) {
+    Write-Warning "$(Split-Path -Leaf $browserPath) did not draw the graphs (see graphs.log): they stay as text in the PDF."
+    return $Html
+  }
+  $graphText = [System.Net.WebUtility]::HtmlDecode($output.Groups[1].Value)
+  if (-not $graphText) {
+    return $Html
+  }
+  $graphs = $graphText.Split([string[]]@('<!--ardareport-graph-->'), [StringSplitOptions]::None)
+
+  # The same blocks in the fetched HTML, in page order: a code with the graph class inside a pre, or the pre itself.
+  $types = [regex]::Matches($graphText, 'data-ardareport-graph="([^"]+)"') | ForEach-Object { [regex]::Escape($_.Groups[1].Value) } | Select-Object -Unique
+  $classPattern = 'class="(?:[^"]*\s)?language-(?:' + ($types -join '|') + ')(?:\s[^"]*)?"'
+  $blockPattern = '<pre\b[^>]*>\s*<code\b[^>]*' + $classPattern + '[^>]*>[\s\S]*?</code>\s*</pre>|<pre\b[^>]*' + $classPattern + '[^>]*>[\s\S]*?</pre>'
+  $blockCount = [regex]::Matches($Html, $blockPattern).Count
+  if ($blockCount -ne $graphs.Count) {
+    Write-Warning "The page has $blockCount graph blocks but $($graphs.Count) graphs were drawn: they stay as text in the PDF."
+    return $Html
+  }
+  Write-Host "Graphs drawn as images: $($graphs.Count)"
+  $queue = [System.Collections.Queue]::new($graphs)
+  return [regex]::Replace($Html, $blockPattern, [System.Text.RegularExpressions.MatchEvaluator] { param($match) $queue.Dequeue() })
+}
  
 $session = [Microsoft.PowerShell.Commands.WebRequestSession]::new()
 $cookie = [System.Net.Cookie]::new($authcookies_key, $authcookies_value)
@@ -155,6 +248,7 @@ left: 0 !important;
 $url = "$root_URL/?p=$article" 
 
 $htmlContent = Invoke-RestMethod   -Uri $url  -WebSession $session
+$htmlContent = Add-GraphImages -Html $htmlContent -WorkFolder $TempFolder
 $checkEmoji = [char]0x2705
 $htmlContent = $htmlContent.Replace($checkEmoji.ToString(), '<img align="absmiddle" alt=":white_check_mark:" class="emoji" src="https://gi.grassone.be/wp-content/plugins/wp-githuber-md/assets/vendor/emojify/images/white_check_mark.png" title=":white_check_mark:">')
 
