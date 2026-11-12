@@ -398,7 +398,23 @@ $arggumen = "-dBATCH", "-dNOPAUSE", "-sDEVICE=pdfwrite", "-dTotalPage=($($p))", 
 $arggumen += $arggumenFile
 write-host $arggumen
 Start-Process -NoNewWindow -Wait -FilePath $ghostscriptPath   -ArgumentList $arggumen    -RedirectStandardError  (Join-Path $TempFolder 'merging.log')
-Move-Item $outputPDFFinal  $outputPDF -Force
+# Keep no earlier report from being overwritten: when a PDF of this name already exists (another
+# report written the same day), keep the name and add a number, the way Windows does for a copy,
+# "<name> (2).pdf", "<name> (3).pdf"... The launcher opens the name written here, in lastpdf.txt.
+$finalPDF = $outputPDF
+if (Test-Path -LiteralPath $finalPDF) {
+  $pdfFolder = Split-Path -Path $outputPDF -Parent
+  $pdfBase = [System.IO.Path]::GetFileNameWithoutExtension($outputPDF)
+  $pdfExtension = [System.IO.Path]::GetExtension($outputPDF)
+  $pdfNumber = 2
+  do {
+    $finalPDF = Join-Path $pdfFolder "$pdfBase ($pdfNumber)$pdfExtension"
+    $pdfNumber++
+  } while (Test-Path -LiteralPath $finalPDF)
+}
+Move-Item -LiteralPath $outputPDFFinal -Destination $finalPDF -Force
+[System.IO.File]::WriteAllText((Join-Path $Log_folder 'lastpdf.txt'), $finalPDF)
+Write-Host "PDF written: $finalPDF"
 #Get-ChildItem -LiteralPath $TempFolder -File |
 #  Where-Object { $_.Extension -ne '.log' } |
 #  Remove-Item -Force

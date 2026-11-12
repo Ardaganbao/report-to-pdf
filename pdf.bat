@@ -22,6 +22,8 @@ set counter=1
 REM Temporary folder for individual PDFs
 set tempdir=%~dp0temp_pdf
 if not exist "%tempdir%" mkdir "%tempdir%"
+REM The script writes the real PDF name here; clear it so a failed run does not open last time's file.
+del "%tempdir%\lastpdf.txt" >nul 2>&1
 set URL=https://gi.grassone.be/?p=%Art%
  
 REM Read the input HTML or report content
@@ -48,8 +50,10 @@ powershell  -ExecutionPolicy Bypass -File "%~dp0htmltoPDF.ps1" -authcookies_key 
  
  
  
-REM Open the resulting PDF
-"%thefiles%\%name%.pdf"
+REM Open the resulting PDF (its real name, which may have a number added to avoid overwriting)
+set "finalpdf=%thefiles%\%name%.pdf"
+if exist "%tempdir%\lastpdf.txt" set /p finalpdf=<"%tempdir%\lastpdf.txt"
+"%finalpdf%"
 
 goto :EOF
 
