@@ -43,7 +43,11 @@ if (-not $ghostscriptPath) {
 function Add-GraphImages {
   param ([string]$Html, [string]$WorkFolder)
 
-  if ($Html -notmatch 'id=["'']ardareport-graphs-js["'']') {
+  # Chart.js graphs (ardareport/view.js) and Mermaid diagrams both render in the browser only; the
+  # browser below draws them so wkhtmltopdf, whose engine cannot, gets pictures.
+  $hasGraphs = $Html -match 'id=["'']ardareport-graphs-js["'']'
+  $hasMermaid = $Html -match 'class="(?:[^"]*\s)?language-mermaid'
+  if (-not $hasGraphs -and -not $hasMermaid) {
     return $Html
   }
   $browserPath = @(
@@ -66,26 +70,97 @@ function Add-GraphImages {
   $collector = @'
 <script>
 window.addEventListener('load', function () {
-  var blocks = document.querySelectorAll('[data-ardareport-graph]'), graphs = [];
-  for (var i = 0; i < blocks.length; i++) {
-    if (blocks[i].getAttribute('data-ardareport-graph') === 'Ardagram') {
-      continue;
-    }
-    var container = blocks[i].parentNode.tagName === 'PRE' ? blocks[i].parentNode : blocks[i];
-    var copy = container.cloneNode(true), canvases = container.getElementsByTagName('canvas'), copies = copy.getElementsByTagName('canvas');
-    for (var j = canvases.length - 1; j >= 0; j--) {
-      var image = document.createElement('img');
-      image.src = canvases[j].toDataURL('image/png');
-      image.alt = canvases[j].getAttribute('aria-label') || '';
-      image.style.cssText = canvases[j].style.cssText;
-      copies[j].parentNode.replaceChild(image, copies[j]);
-    }
-    graphs.push(copy.outerHTML);
+  var started = Date.now();
+  // Mermaid draws asynchronously and marks each diagram data-processed when done; wait for them.
+  function pending() {
+    return document.querySelectorAll('.mermaid:not([data-processed])').length;
   }
-  var output = document.createElement('pre');
-  output.id = 'ardareport-graph-images';
-  output.textContent = graphs.join('<!--ardareport-graph-->');
-  document.body.appendChild(output);
+  // Chart.js graphs: a copy of each ardareport block with its canvases turned into PNG images.
+  function drawGraphs() {
+    var blocks = document.querySelectorAll('[data-ardareport-graph]'), graphs = [];
+    for (var i = 0; i < blocks.length; i++) {
+      if (blocks[i].getAttribute('data-ardareport-graph') === 'Ardagram') {
+        continue;
+      }
+      var container = blocks[i].parentNode.tagName === 'PRE' ? blocks[i].parentNode : blocks[i];
+      var copy = container.cloneNode(true), canvases = container.getElementsByTagName('canvas'), copies = copy.getElementsByTagName('canvas');
+      for (var j = canvases.length - 1; j >= 0; j--) {
+        var image = document.createElement('img');
+        image.src = canvases[j].toDataURL('image/png');
+        image.alt = canvases[j].getAttribute('aria-label') || '';
+        image.style.cssText = canvases[j].style.cssText;
+        copies[j].parentNode.replaceChild(image, copies[j]);
+      }
+      graphs.push(copy.outerHTML);
+    }
+    var output = document.createElement('pre');
+    output.id = 'ardareport-graph-images';
+    output.textContent = graphs.join('<!--ardareport-graph-->');
+    document.body.appendChild(output);
+  }
+  // Mermaid diagrams: each rendered SVG drawn to a PNG so wkhtmltopdf keeps the labels (it does not
+  // draw foreignObject). One picture per .mermaid block, in page order; the SVG itself as a fallback.
+  function drawMermaid() {
+    var blocks = document.querySelectorAll('.mermaid'), results = new Array(blocks.length), remaining = blocks.length;
+    function done() {
+      var holder = document.createElement('pre');
+      holder.id = 'ardareport-mermaid-images';
+      holder.textContent = [].join.call(results, '<!--ardareport-graph-->');
+      document.body.appendChild(holder);
+    }
+    if (remaining === 0) {
+      done();
+      return;
+    }
+    for (var i = 0; i < blocks.length; i++) {
+      (function (idx) {
+        var svg = blocks[idx].querySelector('svg');
+        function settle(html) {
+          results[idx] = html;
+          if (--remaining === 0) {
+            done();
+          }
+        }
+        if (!svg) {
+          settle('<pre style="text-align:center;background:none;border:0;">' + blocks[idx].outerHTML + '</pre>');
+          return;
+        }
+        var box = svg.getBoundingClientRect();
+        var w = Math.max(1, Math.round(box.width || svg.clientWidth || 800));
+        var h = Math.max(1, Math.round(box.height || svg.clientHeight || 600));
+        var clone = svg.cloneNode(true);
+        clone.setAttribute('width', w);
+        clone.setAttribute('height', h);
+        var xml = new XMLSerializer().serializeToString(clone);
+        function fallback() {
+          settle('<pre style="text-align:center;background:none;border:0;">' + svg.outerHTML + '</pre>');
+        }
+        var img = new Image();
+        img.onload = function () {
+          try {
+            var canvas = document.createElement('canvas');
+            canvas.width = w * 2;
+            canvas.height = h * 2;
+            var context = canvas.getContext('2d');
+            context.setTransform(2, 0, 0, 2, 0, 0);
+            context.drawImage(img, 0, 0, w, h);
+            settle('<pre style="text-align:center;background:none;border:0;"><img style="max-width:100%;height:auto;" src="' + canvas.toDataURL('image/png') + '"></pre>');
+          } catch (e) {
+            fallback();
+          }
+        };
+        img.onerror = fallback;
+        img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(xml);
+      })(i);
+    }
+  }
+  var timer = setInterval(function () {
+    if (pending() === 0 || Date.now() - started > 8000) {
+      clearInterval(timer);
+      drawGraphs();
+      drawMermaid();
+    }
+  }, 200);
 });
 </script>
 '@
@@ -95,7 +170,7 @@ window.addEventListener('load', function () {
 
   # A short profile path: the browser's cache folders are deep and break the 260 characters limit.
   $profileFolder = Join-Path $env:TEMP ('report-to-pdf-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
-  $browserArguments = '--headless', '--disable-gpu', '--no-first-run', '--no-default-browser-check', "--user-data-dir=`"$profileFolder`"", '--virtual-time-budget=10000', '--dump-dom', "`"$sourceFile`""
+  $browserArguments = '--headless', '--disable-gpu', '--no-first-run', '--no-default-browser-check', "--user-data-dir=`"$profileFolder`"", '--virtual-time-budget=15000', '--dump-dom', "`"$sourceFile`""
   $browser = Start-Process -NoNewWindow -PassThru -FilePath $browserPath -ArgumentList $browserArguments -RedirectStandardOutput $dumpFile -RedirectStandardError (Join-Path $WorkFolder 'graphs.log')
   # Edge waits forever when a policy forces the sign-in.
   if (-not $browser.WaitForExit(30000)) {
@@ -106,29 +181,57 @@ window.addEventListener('load', function () {
   Remove-Item -LiteralPath $profileFolder -Recurse -Force -ErrorAction SilentlyContinue
 
   $dump = [string](Get-Content -LiteralPath $dumpFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue)
-  $output = [regex]::Match($dump, '<pre id="ardareport-graph-images">([\s\S]*?)</pre>')
-  if (-not $output.Success) {
-    Write-Warning "$(Split-Path -Leaf $browserPath) did not draw the graphs (see graphs.log): they stay as text in the PDF."
-    return $Html
-  }
-  $graphText = [System.Net.WebUtility]::HtmlDecode($output.Groups[1].Value)
-  if (-not $graphText) {
-    return $Html
-  }
-  $graphs = $graphText.Split([string[]]@('<!--ardareport-graph-->'), [StringSplitOptions]::None)
 
-  # The same blocks in the fetched HTML, in page order: a code with the graph class inside a pre, or the pre itself.
-  $types = [regex]::Matches($graphText, 'data-ardareport-graph="([^"]+)"') | ForEach-Object { [regex]::Escape($_.Groups[1].Value) } | Select-Object -Unique
-  $classPattern = 'class="(?:[^"]*\s)?language-(?:' + ($types -join '|') + ')(?:\s[^"]*)?"'
-  $blockPattern = '<pre\b[^>]*>\s*<code\b[^>]*' + $classPattern + '[^>]*>[\s\S]*?</code>\s*</pre>|<pre\b[^>]*' + $classPattern + '[^>]*>[\s\S]*?</pre>'
-  $blockCount = [regex]::Matches($Html, $blockPattern).Count
-  if ($blockCount -ne $graphs.Count) {
-    Write-Warning "The page has $blockCount graph blocks but $($graphs.Count) graphs were drawn: they stay as text in the PDF."
-    return $Html
+  # The Chart.js graphs: replace each ardareport code block with the picture of its chart.
+  if ($hasGraphs) {
+    $output = [regex]::Match($dump, '<pre id="ardareport-graph-images">([\s\S]*?)</pre>')
+    $graphText = if ($output.Success) { [System.Net.WebUtility]::HtmlDecode($output.Groups[1].Value) } else { '' }
+    if ($graphText) {
+      $graphs = $graphText.Split([string[]]@('<!--ardareport-graph-->'), [StringSplitOptions]::None)
+      # The same blocks in the fetched HTML, in page order: a code with the graph class inside a pre, or the pre itself.
+      $types = @([regex]::Matches($graphText, 'data-ardareport-graph="([^"]+)"') | ForEach-Object { [regex]::Escape($_.Groups[1].Value) } | Select-Object -Unique)
+      if ($types.Count -gt 0) {
+        $classPattern = 'class="(?:[^"]*\s)?language-(?:' + ($types -join '|') + ')(?:\s[^"]*)?"'
+        $blockPattern = '<pre\b[^>]*>\s*<code\b[^>]*' + $classPattern + '[^>]*>[\s\S]*?</code>\s*</pre>|<pre\b[^>]*' + $classPattern + '[^>]*>[\s\S]*?</pre>'
+        $blockCount = [regex]::Matches($Html, $blockPattern).Count
+        if ($blockCount -eq $graphs.Count) {
+          Write-Host "Graphs drawn as images: $($graphs.Count)"
+          $graphQueue = [System.Collections.Queue]::new($graphs)
+          $Html = [regex]::Replace($Html, $blockPattern, [System.Text.RegularExpressions.MatchEvaluator] { param($match) $graphQueue.Dequeue() })
+        }
+        else {
+          Write-Warning "The page has $blockCount graph blocks but $($graphs.Count) graphs were drawn: they stay as text in the PDF."
+        }
+      }
+    }
+    elseif (-not $hasMermaid) {
+      Write-Warning "$(Split-Path -Leaf $browserPath) did not draw the graphs (see graphs.log): they stay as text in the PDF."
+    }
   }
-  Write-Host "Graphs drawn as images: $($graphs.Count)"
-  $queue = [System.Collections.Queue]::new($graphs)
-  return [regex]::Replace($Html, $blockPattern, [System.Text.RegularExpressions.MatchEvaluator] { param($match) $queue.Dequeue() })
+
+  # The Mermaid diagrams: replace each language-mermaid code block with the picture of its diagram.
+  if ($hasMermaid) {
+    $output = [regex]::Match($dump, '<pre id="ardareport-mermaid-images">([\s\S]*?)</pre>')
+    $mermaidText = if ($output.Success) { [System.Net.WebUtility]::HtmlDecode($output.Groups[1].Value) } else { '' }
+    if ($mermaidText) {
+      $diagrams = $mermaidText.Split([string[]]@('<!--ardareport-graph-->'), [StringSplitOptions]::None)
+      $mermaidPattern = '<pre\b[^>]*>\s*<code\b[^>]*class="(?:[^"]*\s)?language-mermaid(?:\s[^"]*)?"[^>]*>[\s\S]*?</code>\s*</pre>'
+      $mermaidCount = [regex]::Matches($Html, $mermaidPattern).Count
+      if ($mermaidCount -eq $diagrams.Count) {
+        Write-Host "Mermaid diagrams drawn as images: $($diagrams.Count)"
+        $mermaidQueue = [System.Collections.Queue]::new($diagrams)
+        $Html = [regex]::Replace($Html, $mermaidPattern, [System.Text.RegularExpressions.MatchEvaluator] { param($match) $mermaidQueue.Dequeue() })
+      }
+      else {
+        Write-Warning "The page has $mermaidCount Mermaid blocks but $($diagrams.Count) were drawn: they stay as text in the PDF."
+      }
+    }
+    else {
+      Write-Warning "$(Split-Path -Leaf $browserPath) did not draw the Mermaid diagrams (see graphs.log): they stay as text in the PDF."
+    }
+  }
+
+  return $Html
 }
  
 $session = [Microsoft.PowerShell.Commands.WebRequestSession]::new()
