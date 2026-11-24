@@ -370,12 +370,12 @@ function ConvertTo-MoseActionsTable {
 
   # Synthese: the counts, the way the workbook's Synthese sheet summed them.
   $total = $parsed.Count
-  $synth = '<p style="font-family:''Fira Sans'',Arial,sans-serif;font-size:9.5pt;margin:6px 0 0;"><strong>Synth&#232;se &#8212;</strong> Total : ' + $total
-  $synth += ' &#183; <span style="color:#d93025;font-weight:bold;">&#9679; Red : ' + $counts.red + '</span>'
-  $synth += ' &#183; <span style="color:#e8710a;font-weight:bold;">&#9679; Orange : ' + $counts.orange + '</span>'
-  $synth += ' &#183; <span style="color:#188038;font-weight:bold;">&#9679; Green : ' + $counts.green + '</span>'
-  if ($ownerIndex -ge 0) { $synth += ' &#183; Sans owner : ' + $noOwner }
-  if ($dueIndex -ge 0) { $synth += ' &#183; Avec &#233;ch&#233;ance : ' + $withDue }
+  $synth = '<p style="font-family:''Fira Sans'',Arial,sans-serif;font-size:9.5pt;margin:6px 0 0;"><strong>Summary &#8212;</strong> Total: ' + $total
+  $synth += ' &#183; <span style="color:#d93025;font-weight:bold;">&#9679; Red: ' + $counts.red + '</span>'
+  $synth += ' &#183; <span style="color:#e8710a;font-weight:bold;">&#9679; Orange: ' + $counts.orange + '</span>'
+  $synth += ' &#183; <span style="color:#188038;font-weight:bold;">&#9679; Green: ' + $counts.green + '</span>'
+  if ($ownerIndex -ge 0) { $synth += ' &#183; No owner: ' + $noOwner }
+  if ($dueIndex -ge 0) { $synth += ' &#183; With due date: ' + $withDue }
   $synth += '</p>'
   [void]$sb.Append($synth)
   [void]$sb.Append('</div>')
