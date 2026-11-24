@@ -234,6 +234,170 @@ window.addEventListener('load', function () {
   return $Html
 }
  
+# A ``` mose-actions fenced block becomes a Red/Orange/Green action-tracker ("Suivi des actions").
+# red/orange/green (or rouge/vert, R/O/G, ok/done...) in the Status column tints each row; a Synthese
+# line with the counts is added below. Built as inline-styled HTML so it survives WordPress and prints
+# in wkhtmltopdf, whose engine draws the table and backgrounds fine (only modern JavaScript fails it).
+function Get-MoseActionStatus {
+  param([string]$Value)
+  $v = ("$Value").Trim().ToLowerInvariant()
+  if (-not $v) { return $null }
+  $red = @('r', 'red', 'rouge', 'rood', 'rot', 'critical', 'crit', 'high', 'urgent', 'ko', 'nok', '3')
+  $orange = @('o', 'a', 'orange', 'amber', 'oranje', 'medium', 'med', 'warning', 'warn', 'attention', 'ongoing', 'wip', 'in progress', 'en cours', '2')
+  $green = @('g', 'v', 'green', 'vert', 'groen', 'ok', 'done', 'resolved', 'resolu', 'closed', 'clos', 'fait', 'low', '1')
+  if ($red -contains $v) { return 'red' }
+  if ($orange -contains $v) { return 'orange' }
+  if ($green -contains $v) { return 'green' }
+  switch ($v[0]) {
+    'r' { return 'red' }
+    'o' { return 'orange' }
+    'a' { return 'orange' }
+    'g' { return 'green' }
+    'v' { return 'green' }
+    default { return $null }
+  }
+}
+
+function ConvertTo-MoseActionsTable {
+  param([string]$Text)
+
+  $enc = { param($s) [System.Net.WebUtility]::HtmlEncode("$s") }
+  $palette = @{
+    red     = @{ Row = '#fdecea'; Bar = '#d93025'; Pill = '#d93025' }
+    orange  = @{ Row = '#fff4e5'; Bar = '#e8710a'; Pill = '#e8710a' }
+    green   = @{ Row = '#e7f4ea'; Bar = '#188038'; Pill = '#188038' }
+    neutral = @{ Row = '#ffffff'; Bar = '#cfd4da'; Pill = '#5f6368' }
+  }
+
+  $title = $null
+  $parsed = [System.Collections.Generic.List[string[]]]::new()
+  foreach ($line in ($Text -split "\r?\n")) {
+    $trimmed = $line.Trim()
+    if (-not $trimmed) { continue }
+    if ($trimmed.StartsWith('#')) { $title = $trimmed.TrimStart('#').Trim(); continue }
+    if ($trimmed -match '^\|?\s*[-:| ]+\s*\|?$' -and $trimmed -match '-') { continue } # a markdown divider row
+    $parts = $trimmed -split '\|'
+    $startIdx = 0
+    $endIdx = $parts.Count - 1
+    if ($trimmed.StartsWith('|')) { $startIdx = 1 }
+    if ($trimmed.EndsWith('|')) { $endIdx = $parts.Count - 2 }
+    $cells = [System.Collections.Generic.List[string]]::new()
+    for ($i = $startIdx; $i -le $endIdx; $i++) { $cells.Add($parts[$i].Trim()) }
+    if ($cells.Count -gt 0) { $parsed.Add($cells.ToArray()) }
+  }
+  if ($parsed.Count -eq 0) { return '' }
+
+  # The header row: the first line whose cells name the columns. Otherwise the workbook's column order.
+  $headerWords = 'issue|solution|owner|due|date|status|statut|comment|action|probl|responsable|.cheance|priorit'
+  $header = $null
+  $statusIndex = -1; $ownerIndex = -1; $dueIndex = -1
+  $first = $parsed[0]
+  if (@($first | Where-Object { $_ -match "(?i)$headerWords" }).Count -ge 2) {
+    $header = $first
+    $parsed.RemoveAt(0)
+    for ($i = 0; $i -lt $header.Count; $i++) {
+      if ($statusIndex -lt 0 -and $header[$i] -match '(?i)status|statut|rag') { $statusIndex = $i }
+      if ($ownerIndex -lt 0 -and $header[$i] -match '(?i)owner|responsable|assign') { $ownerIndex = $i }
+      if ($dueIndex -lt 0 -and $header[$i] -match '(?i)due|date|.ch.ance|deadline') { $dueIndex = $i }
+    }
+  }
+  else {
+    $header = @('Issue', 'Solution', 'Owner', 'Due date', 'Status', 'Comments')
+    $statusIndex = 4; $ownerIndex = 2; $dueIndex = 3
+  }
+  $columns = $header.Count
+
+  # When no column was named "status", the one whose values all read as red/orange/green.
+  if ($statusIndex -lt 0) {
+    for ($c = 0; $c -lt $columns; $c++) {
+      $hits = 0; $vals = 0
+      foreach ($row in $parsed) {
+        if ($c -lt $row.Count -and $row[$c]) { $vals++; if (Get-MoseActionStatus $row[$c]) { $hits++ } }
+      }
+      if ($vals -gt 0 -and $hits -eq $vals) { $statusIndex = $c; break }
+    }
+  }
+
+  $counts = @{ red = 0; orange = 0; green = 0; neutral = 0 }
+  $noOwner = 0; $withDue = 0
+
+  $sb = [System.Text.StringBuilder]::new()
+  [void]$sb.Append('<div class="mose-actions" style="margin:14px 0;">')
+  if ($title) {
+    [void]$sb.Append('<p style="font-family:''Fira Sans'',Arial,sans-serif;font-weight:bold;font-size:13pt;margin:0 0 6px;">' + (& $enc $title) + '</p>')
+  }
+  [void]$sb.Append('<table style="border-collapse:collapse;width:100%;font-family:''Fira Sans'',Arial,sans-serif;font-size:10pt;">')
+  [void]$sb.Append('<thead><tr>')
+  for ($i = 0; $i -lt $columns; $i++) {
+    $align = if ($i -eq $statusIndex) { 'center' } else { 'left' }
+    [void]$sb.Append('<th style="background:#1f3864;color:#fff;text-align:' + $align + ';padding:6px 8px;border:1px solid #cfd4da;font-weight:bold;">' + (& $enc $header[$i]) + '</th>')
+  }
+  [void]$sb.Append('</tr></thead><tbody>')
+
+  foreach ($row in $parsed) {
+    $status = if ($statusIndex -ge 0 -and $statusIndex -lt $row.Count) { Get-MoseActionStatus $row[$statusIndex] } else { $null }
+    $key = if ($status) { $status } else { 'neutral' }
+    $counts[$key]++
+    if ($ownerIndex -ge 0) { if ($ownerIndex -ge $row.Count -or -not $row[$ownerIndex]) { $noOwner++ } }
+    if ($dueIndex -ge 0) { if ($dueIndex -lt $row.Count -and $row[$dueIndex]) { $withDue++ } }
+    $tint = $palette[$key]
+    [void]$sb.Append('<tr style="background:' + $tint.Row + ';">')
+    for ($i = 0; $i -lt $columns; $i++) {
+      $value = if ($i -lt $row.Count) { $row[$i] } else { '' }
+      if ($i -eq 0) {
+        $cellStyle = 'padding:6px 8px;border:1px solid #cfd4da;vertical-align:top;border-left:4px solid ' + $tint.Bar + ';'
+      }
+      else {
+        $cellStyle = 'padding:6px 8px;border:1px solid #cfd4da;vertical-align:top;'
+      }
+      if ($i -eq $statusIndex) {
+        if ($status) {
+          $label = if ($value) { & $enc $value } else { $key.Substring(0, 1).ToUpper() + $key.Substring(1) }
+          $pill = '<span style="display:inline-block;padding:2px 12px;border-radius:11px;background:' + $tint.Pill + ';color:#fff;font-weight:bold;white-space:nowrap;">' + $label + '</span>'
+          [void]$sb.Append('<td style="' + $cellStyle + 'text-align:center;">' + $pill + '</td>')
+        }
+        else {
+          [void]$sb.Append('<td style="' + $cellStyle + 'text-align:center;">' + (& $enc $value) + '</td>')
+        }
+      }
+      else {
+        [void]$sb.Append('<td style="' + $cellStyle + '">' + (& $enc $value) + '</td>')
+      }
+    }
+    [void]$sb.Append('</tr>')
+  }
+  [void]$sb.Append('</tbody></table>')
+
+  # Synthese: the counts, the way the workbook's Synthese sheet summed them.
+  $total = $parsed.Count
+  $synth = '<p style="font-family:''Fira Sans'',Arial,sans-serif;font-size:9.5pt;margin:6px 0 0;"><strong>Synth&#232;se &#8212;</strong> Total : ' + $total
+  $synth += ' &#183; <span style="color:#d93025;font-weight:bold;">&#9679; Red : ' + $counts.red + '</span>'
+  $synth += ' &#183; <span style="color:#e8710a;font-weight:bold;">&#9679; Orange : ' + $counts.orange + '</span>'
+  $synth += ' &#183; <span style="color:#188038;font-weight:bold;">&#9679; Green : ' + $counts.green + '</span>'
+  if ($ownerIndex -ge 0) { $synth += ' &#183; Sans owner : ' + $noOwner }
+  if ($dueIndex -ge 0) { $synth += ' &#183; Avec &#233;ch&#233;ance : ' + $withDue }
+  $synth += '</p>'
+  [void]$sb.Append($synth)
+  [void]$sb.Append('</div>')
+  return $sb.ToString()
+}
+
+function Expand-MoseActions {
+  param([string]$Html)
+  $pattern = '<pre\b[^>]*>\s*<code\b[^>]*class="(?:[^"]*\s)?language-mose-actions(?:\s[^"]*)?"[^>]*>([\s\S]*?)</code>\s*</pre>'
+  if (-not [regex]::IsMatch($Html, $pattern)) { return $Html }
+  $count = 0
+  $Html = [regex]::Replace($Html, $pattern, [System.Text.RegularExpressions.MatchEvaluator] {
+      param($match)
+      $raw = [System.Net.WebUtility]::HtmlDecode($match.Groups[1].Value)
+      $table = ConvertTo-MoseActionsTable -Text $raw
+      if ($table) { $script:__moseActionsHit = $true; $table } else { $match.Value }
+    })
+  $count = ([regex]::Matches($Html, 'class="mose-actions"')).Count
+  if ($count -gt 0) { Write-Host "Action-tracker tables drawn: $count" }
+  return $Html
+}
+
 $session = [Microsoft.PowerShell.Commands.WebRequestSession]::new()
 $cookie = [System.Net.Cookie]::new($authcookies_key, $authcookies_value)
 $session.Cookies.Add($root_URL, $cookie)
@@ -352,6 +516,7 @@ $url = "$root_URL/?p=$article"
 
 $htmlContent = Invoke-RestMethod   -Uri $url  -WebSession $session
 $htmlContent = Add-GraphImages -Html $htmlContent -WorkFolder $TempFolder
+$htmlContent = Expand-MoseActions -Html $htmlContent
 $checkEmoji = [char]0x2705
 $htmlContent = $htmlContent.Replace($checkEmoji.ToString(), '<img align="absmiddle" alt=":white_check_mark:" class="emoji" src="https://gi.grassone.be/wp-content/plugins/wp-githuber-md/assets/vendor/emojify/images/white_check_mark.png" title=":white_check_mark:">')
 
