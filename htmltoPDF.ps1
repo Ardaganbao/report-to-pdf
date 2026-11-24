@@ -398,6 +398,46 @@ function Expand-MoseActions {
   return $Html
 }
 
+# The headings wkhtmltopdf recorded for one rendered section, in page order, as {Title; Page} (the
+# page is 1-based within that section's PDF). Read as UTF-8 so accented titles match the headings.
+function Get-OutlineItems {
+  param([string]$XmlPath)
+  $result = New-Object System.Collections.Generic.List[object]
+  if (-not (Test-Path $XmlPath)) { return $result }
+  try { $doc = New-Object System.Xml.XmlDocument; $doc.Load($XmlPath) } catch { return $result }
+  $root = $doc.DocumentElement
+  if (-not $root) { return $result }
+  $stack = New-Object System.Collections.Generic.Stack[System.Xml.XmlNode]
+  for ($i = $root.ChildNodes.Count - 1; $i -ge 0; $i--) { $stack.Push($root.ChildNodes[$i]) }
+  while ($stack.Count -gt 0) {
+    $node = $stack.Pop()
+    if ($node.LocalName -eq 'item') {
+      $title = [System.Net.WebUtility]::HtmlDecode(((($node.GetAttribute('title')) -replace '\s+', ' '))).Trim()
+      $page = 0; [void][int]::TryParse($node.GetAttribute('page'), [ref]$page)
+      $result.Add([pscustomobject]@{ Title = $title; Page = $page })
+      for ($i = $node.ChildNodes.Count - 1; $i -ge 0; $i--) { $stack.Push($node.ChildNodes[$i]) }
+    }
+  }
+  return $result
+}
+
+# The Table of contents HTML: one table row per heading, its page number right-aligned (blank until
+# the second pass fills it). Identical markup in both passes so the page count does not shift.
+function ConvertTo-MoseTocHtml {
+  param([object[]]$Entries)
+  $sb = [System.Text.StringBuilder]::new()
+  [void]$sb.Append('<div class="mose-toc" style="page-break-after:always;padding:10mm 14mm;font-family:''Fira Sans'',Arial,sans-serif;color:#242852;">')
+  [void]$sb.Append('<style>.mose-toc .e{overflow:hidden;margin:4px 0;line-height:1.5;}.mose-toc .e .p{float:right;padding-left:6px;background:#fff;}.mose-toc .e .t::after{content:" ......................................................................................................................................................... ";color:#9aa0a6;letter-spacing:2px;}.mose-toc .l2{font-weight:bold;font-size:13pt;margin-top:8px;}.mose-toc .l3{font-weight:normal;font-size:11pt;padding-left:8mm;}</style>')
+  [void]$sb.Append('<div style="font-size:22pt;font-weight:bold;margin:0 0 16px;">Table of contents</div>')
+  foreach ($e in $Entries) {
+    if ($e.Level -ne 2 -and $e.Level -ne 3) { continue }
+    $page = if ($e.Page) { $e.Page } else { '' }
+    [void]$sb.Append('<div class="e l' + $e.Level + '"><span class="p">' + $page + '</span><span class="t">' + $e.Label + ' ' + [System.Net.WebUtility]::HtmlEncode($e.Text) + '</span></div>')
+  }
+  [void]$sb.Append('</div>')
+  return $sb.ToString()
+}
+
 $session = [Microsoft.PowerShell.Commands.WebRequestSession]::new()
 $cookie = [System.Net.Cookie]::new($authcookies_key, $authcookies_value)
 $session.Cookies.Add($root_URL, $cookie)
@@ -407,9 +447,10 @@ $TempFolder = Join-Path $Log_folder ([Guid]::NewGuid().ToString('N'))
 $null = New-Item -ItemType Directory -Path $TempFolder -Force
 Write-Host "Temporary files: $TempFolder"
 $printStylesheet = Join-Path $TempFolder 'print-layout.css'
-$printCss = @'
-
-'@
+# report.css sets h2{page-break-before:always}; wkhtmltopdf mishandles it and leaves a near-empty
+# page showing only the heading before each section. Flow the sections instead. report.css still has
+# h2{page-break-after:avoid}, so a heading is never orphaned at the foot of a page.
+$printCss = "h2 { page-break-before: auto !important; }"
  
 $coverPrintCss = @'
 .wp-block-group.is-nowrap {
@@ -592,6 +633,33 @@ $splitContent | ForEach-Object {
 
 Rename-Item -Path "$TempFolder\section$($counter).html" -NewName "end.html"
 $counter = 0 
+$headingCount = 0; $subheadingCount = 0; $subheadingh3Count = 0
+
+# A clickable Table of contents, built from the report's headings and numbered the way report.css
+# numbers them (h2 -> "N)", h3 -> "N.M)", h4 -> "N.M.K"). It is written into the first section just
+# after the cover; each entry links to an id injected into the matching heading below.
+$script:tocRender = 0
+$tocEntries = New-Object System.Collections.Generic.List[object]
+$tocH = 0; $tocSH = 0; $tocSHH3 = 0; $tocInReport = $false; $tocAnchor = 0
+foreach ($tocChunk in $splitContent) {
+  if ($tocChunk -match $startToken) { $tocInReport = $true; $tocH = 0; $tocSH = 0; $tocSHH3 = 0; continue }
+  if ($tocChunk -match $endToken) { $tocInReport = $false; continue }
+  if (-not $tocInReport) { continue }
+  if (($tocChunk -match $LandScapeToken) -or ($tocChunk -match $PortaitToken)) { continue }
+  foreach ($tocMatch in [regex]::Matches($tocChunk, '<h([234])\b[^>]*>(.*?)</h[234]>', ([System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::Singleline))) {
+    $tocAnchor++
+    $tocText = [System.Net.WebUtility]::HtmlDecode((([regex]::Replace($tocMatch.Groups[2].Value, '<[^>]+>', '')) -replace '\s+', ' ')).Trim()
+    if (-not $tocText) { continue }
+    switch ([int]$tocMatch.Groups[1].Value) {
+      2 { $tocH++; $tocSH = 0; $tocSHH3 = 0; $tocLabel = "$tocH)" }
+      3 { $tocSH++; $tocSHH3 = 0; $tocLabel = "$tocH.$tocSH)" }
+      4 { $tocSHH3++; $tocLabel = "$tocH.$tocSH.$tocSHH3" }
+    }
+    if ([int]$tocMatch.Groups[1].Value -ne 4) { $tocEntries.Add([pscustomobject]@{ Level = [int]$tocMatch.Groups[1].Value; Label = $tocLabel; Text = $tocText; Anchor = $tocAnchor; Page = $null }) }
+  }
+}
+$tocHtml = if ($tocEntries.Count -gt 0) { ConvertTo-MoseTocHtml $tocEntries } else { '' }
+
 foreach ($_ in $splitContent) {
   if ( ($_ -match $LandScapeToken)) {
     $orientation = 'Landscape'
@@ -608,7 +676,7 @@ foreach ($_ in $splitContent) {
     remove-Item  -Path "$TempFolder\section$($counter)_M.html"  -Force | Out-Null
     #remove-Item  -Path "C:\temp_pdf\section$($counter).html"  -Force | Out-Null
     remove-Item  -Path "$TempFolder\section$($counter).pdf"  -Force | Out-Null
-    $counter = 0
+    $counter = 0; $headingCount = 0; $subheadingCount = 0; $subheadingh3Count = 0
     $orientation = 'portrait'
     continue 
   }
@@ -621,8 +689,26 @@ foreach ($_ in $splitContent) {
   $counter++ 
 
   Get-Content -Path "$TempFolder\start.html" | Out-File "$TempFolder\section$($counter)_M.html" -Encoding utf8   
+  # Give each heading an id the Table of contents links to (same order as the TOC was built).
+  $_ = [regex]::Replace($_, '<h([234])\b', { param($tocM) $script:tocRender++; '<h' + $tocM.Groups[1].Value + ' id="mose-toc-' + $script:tocRender + '"' }, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+  if ($counter -eq 1) { $script:firstChunk = $_ }
+  $counterSeed = "<style>main{counter-reset: heading $headingCount subheading $subheadingCount subheadingh3 $subheadingh3Count;}</style>"
+  $counterSeed | Out-File "$TempFolder\section$($counter)_M.html" -Append -Encoding utf8
+  # Put the Table of contents right after the cover (the cover <header> is inside this first section's content).
+  if ($counter -eq 1 -and $tocHtml) {
+    $tocHeaderEnd = $_.IndexOf('</header>', [System.StringComparison]::OrdinalIgnoreCase)
+    if ($tocHeaderEnd -ge 0) { $_ = $_.Insert($tocHeaderEnd + 9, $tocHtml) } else { $_ = $tocHtml + $_ }
+  }
   $_ | Out-File "$TempFolder\section$($counter)_M.html" -Append  -Encoding utf8  
   Get-Content -Path "$TempFolder\end.html" | Out-File "$TempFolder\section$($counter)_M.html" -Append -Encoding utf8 
+  # Advance the heading counters by this section's headings, mirroring report.css.
+  foreach ($headingMatch in [regex]::Matches($_, '<h([234])\b', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+    switch ($headingMatch.Groups[1].Value) {
+      '2' { $headingCount++; $subheadingCount = 0 }
+      '3' { $subheadingCount++; $subheadingh3Count = 0 }
+      '4' { $subheadingh3Count++ }
+    }
+  }
   #remove-Item  -Path "C:\temp_pdf\section$($counter).html" -Force | Out-Null
   Write-Host "preprare : section$($counter)_M.html  $orientation"
   $output = "$TempFolder\section$($counter).pdf" 
@@ -636,8 +722,9 @@ foreach ($_ in $splitContent) {
     $layoutProbe += "(function(){var x=document.getElementsByTagName('*'),matches=[],tail=[];for(var i=0;i<x.length;i++){var c=x[i].className;if(typeof c==='string'&&/footer|template-part|is-nowrap|wp-block-image|wp-block-table/i.test(c)){matches.push(x[i].tagName.toLowerCase()+'.'+c.replace(/\s+/g,'.'));}}for(var j=Math.max(0,x.length-80);j<x.length;j++){var c=x[j].className;if(typeof c!=='string')c='';tail.push(x[j].tagName.toLowerCase()+(c?'.'+c.replace(/\s+/g,'.'):''));}console.log('PDF_FOOTER_NODES='+JSON.stringify(matches));console.log('PDF_DOM_TAIL='+JSON.stringify(tail));var f=document.getElementsByClassName('Footer')[0];if(!f){console.log('PDF_FOOTER=missing');return;}var s=getComputedStyle(f),r=f.getBoundingClientRect(),g=f.getElementsByClassName('wp-block-group')[0],t=f.getElementsByTagName('td');console.log('PDF_FOOTER='+s.position+' bottom='+s.bottom+' rect='+Math.round(r.top)+':'+Math.round(r.bottom)+' row='+(g?getComputedStyle(g).display:'missing')+' border='+(t.length?getComputedStyle(t[0]).borderTopWidth:'missing')+' extraCell='+(t.length>1?getComputedStyle(t[1]).display:'missing'));})();"
   }
   $layoutProbeArgument = '"' + $layoutProbe + '"'
-  $arggumen = '--page-size', 'A4', '--orientation', $orientation, '--background', '--minimum-font-size', '17', '--user-style-sheet', "`"$printStylesheet`"", '--outline', '--log-level', 'info', '--javascript-delay', '1000', '--debug-javascript', '--run-script', $layoutProbeArgument, '--encoding', 'UTF-8', '--print-media-type', '--keep-relative-links', '--image-dpi', '300', "`"$TempFolder\section$($counter)_M.html`"" , "`"$output`""
+  $arggumen = '--page-size', 'A4', '--orientation', $orientation, '--background', '--minimum-font-size', '17', '--user-style-sheet', "`"$printStylesheet`"", '--outline', '--dump-outline', "`"$TempFolder\outline$($counter).xml`"", '--log-level', 'info', '--javascript-delay', '1000', '--debug-javascript', '--run-script', $layoutProbeArgument, '--encoding', 'UTF-8', '--print-media-type', '--keep-relative-links', '--image-dpi', '300', "`"$TempFolder\section$($counter)_M.html`"" , "`"$output`""
  
+  if ($counter -eq 1) { $script:firstArgs = $arggumen; $script:firstSeed = $counterSeed }
   Start-Process -NoNewWindow -Wait -FilePath $wkhtmltopdfPath   -ArgumentList $arggumen       -RedirectStandardError  (Join-Path $TempFolder "section$($counter)_M.log")
  
   ##Remove-Item -Path $TempFile
@@ -649,6 +736,44 @@ foreach ($_ in $splitContent) {
 #$FILE = "C:\\temp_pdf\\section3.pdf"
 #$arggumen = "-dBATCH", "-dQUIET", "-dNODISPLAY", "--permit-file-read=$FILE", "-c", "($FILE) (r) file runpdfbegin pdfpagecount = quit"
 #
+# Second pass: read each section's outline for the real page of every heading, fill the Table of
+# contents with those page numbers, and re-render the first section (same TOC size, so pages hold).
+if ($tocHtml -and $tocEntries.Count -gt 0 -and $script:firstChunk) {
+  $tocGlobal = New-Object System.Collections.Generic.List[object]
+  $tocOffset = 0
+  foreach ($tocPdf in (Get-ChildItem -Path $TempFolder -Filter 'section*.pdf' | Sort-Object { [int]($_.BaseName -replace 'section', '') })) {
+    $tocNum = [int]($tocPdf.BaseName -replace 'section', '')
+    foreach ($oiItem in (Get-OutlineItems (Join-Path $TempFolder "outline$tocNum.xml"))) {
+      $tocGlobal.Add([pscustomobject]@{ Title = $oiItem.Title; Page = $tocOffset + $oiItem.Page })
+    }
+    $tocCntArgs = '-q', '-dNODISPLAY', '-dNOSAFER', "--permit-file-read=`"$TempFolder`"", "-c ""($($tocPdf.Name)) (r) file runpdfbegin pdfpagecount = quit"""
+    Start-Process -NoNewWindow -Wait -WorkingDirectory $TempFolder -FilePath $ghostscriptPath -ArgumentList $tocCntArgs -RedirectStandardOutput (Join-Path $TempFolder 'toccount.txt') | Out-Null
+    $tocOffset += [int](Get-Content (Join-Path $TempFolder 'toccount.txt'))
+  }
+  # Match each entry to the next outline heading with the same text (a subsequence; skip the extras).
+  $gi = 0
+  foreach ($entry in $tocEntries) {
+    $save = $gi; $hit = $false
+    while ($gi -lt $tocGlobal.Count) {
+      if ($tocGlobal[$gi].Title -eq $entry.Text) { $entry.Page = $tocGlobal[$gi].Page; $gi++; $hit = $true; break }
+      $gi++
+    }
+    if (-not $hit) { $gi = $save }
+  }
+  # Rebuild the first section with the numbered TOC after the cover, and re-render it in place.
+  $tocFirst = $script:firstChunk
+  $tocHe = $tocFirst.IndexOf('</header>', [System.StringComparison]::OrdinalIgnoreCase)
+  $tocHtmlNum = ConvertTo-MoseTocHtml $tocEntries
+  if ($tocHe -ge 0) { $tocFirst = $tocFirst.Insert($tocHe + 9, $tocHtmlNum) } else { $tocFirst = $tocHtmlNum + $tocFirst }
+  Set-Content -LiteralPath $printStylesheet -Value ($printCss + [Environment]::NewLine + $coverPrintCss) -Encoding Ascii
+  Get-Content -Path "$TempFolder\start.html" | Out-File "$TempFolder\section1_M.html" -Encoding utf8
+  $script:firstSeed | Out-File "$TempFolder\section1_M.html" -Append -Encoding utf8
+  $tocFirst | Out-File "$TempFolder\section1_M.html" -Append -Encoding utf8
+  Get-Content -Path "$TempFolder\end.html" | Out-File "$TempFolder\section1_M.html" -Append -Encoding utf8
+  Start-Process -NoNewWindow -Wait -FilePath $wkhtmltopdfPath -ArgumentList $script:firstArgs -RedirectStandardError (Join-Path $TempFolder 'section1_M.log')
+  Write-Host "Table of contents: $($tocEntries.Count) entries; page numbers added."
+}
+
 $outputPDFFinal = Join-Path $TempFolder 'merged.pdf'
 $p = 0
 $arggumenFile = "-f", "`"$pageCounterPS`""
