@@ -774,6 +774,7 @@ if ($tocHtml -and $tocEntries.Count -gt 0 -and $script:firstChunk) {
   # pdfmark (h2 with its h3 children), pointing at the pages computed above.
   $bmLines = New-Object System.Collections.Generic.List[string]
   $bmLines.Add('%!PS')
+  $bmLines.Add('[ /PageMode /UseOutlines /DOCVIEW pdfmark')  # open the PDF with the bookmark panel visible
   for ($bi = 0; $bi -lt $tocEntries.Count; $bi++) {
     $bEntry = $tocEntries[$bi]
     if (-not $bEntry.Page) { continue }
