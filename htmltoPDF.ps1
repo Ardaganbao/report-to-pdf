@@ -438,6 +438,16 @@ function ConvertTo-MoseTocHtml {
   return $sb.ToString()
 }
 
+# A pdfmark title string as UTF-16BE hex (with BOM) so accented/dashed headings keep their characters.
+function ConvertTo-PdfmarkText {
+  param([string]$Text)
+  $sb = [System.Text.StringBuilder]::new()
+  [void]$sb.Append('<FEFF')
+  foreach ($ch in $Text.ToCharArray()) { [void]$sb.Append(('{0:X4}' -f [int][uint16]$ch)) }
+  [void]$sb.Append('>')
+  return $sb.ToString()
+}
+
 $session = [Microsoft.PowerShell.Commands.WebRequestSession]::new()
 $cookie = [System.Net.Cookie]::new($authcookies_key, $authcookies_value)
 $session.Cookies.Add($root_URL, $cookie)
@@ -722,7 +732,7 @@ foreach ($_ in $splitContent) {
     $layoutProbe += "(function(){var x=document.getElementsByTagName('*'),matches=[],tail=[];for(var i=0;i<x.length;i++){var c=x[i].className;if(typeof c==='string'&&/footer|template-part|is-nowrap|wp-block-image|wp-block-table/i.test(c)){matches.push(x[i].tagName.toLowerCase()+'.'+c.replace(/\s+/g,'.'));}}for(var j=Math.max(0,x.length-80);j<x.length;j++){var c=x[j].className;if(typeof c!=='string')c='';tail.push(x[j].tagName.toLowerCase()+(c?'.'+c.replace(/\s+/g,'.'):''));}console.log('PDF_FOOTER_NODES='+JSON.stringify(matches));console.log('PDF_DOM_TAIL='+JSON.stringify(tail));var f=document.getElementsByClassName('Footer')[0];if(!f){console.log('PDF_FOOTER=missing');return;}var s=getComputedStyle(f),r=f.getBoundingClientRect(),g=f.getElementsByClassName('wp-block-group')[0],t=f.getElementsByTagName('td');console.log('PDF_FOOTER='+s.position+' bottom='+s.bottom+' rect='+Math.round(r.top)+':'+Math.round(r.bottom)+' row='+(g?getComputedStyle(g).display:'missing')+' border='+(t.length?getComputedStyle(t[0]).borderTopWidth:'missing')+' extraCell='+(t.length>1?getComputedStyle(t[1]).display:'missing'));})();"
   }
   $layoutProbeArgument = '"' + $layoutProbe + '"'
-  $arggumen = '--page-size', 'A4', '--orientation', $orientation, '--background', '--minimum-font-size', '17', '--user-style-sheet', "`"$printStylesheet`"", '--outline', '--dump-outline', "`"$TempFolder\outline$($counter).xml`"", '--log-level', 'info', '--javascript-delay', '1000', '--debug-javascript', '--run-script', $layoutProbeArgument, '--encoding', 'UTF-8', '--print-media-type', '--keep-relative-links', '--image-dpi', '300', "`"$TempFolder\section$($counter)_M.html`"" , "`"$output`""
+  $arggumen = '--page-size', 'A4', '--orientation', $orientation, '--background', '--minimum-font-size', '17', '--user-style-sheet', "`"$printStylesheet`"", '--no-outline', '--dump-outline', "`"$TempFolder\outline$($counter).xml`"", '--log-level', 'info', '--javascript-delay', '1000', '--debug-javascript', '--run-script', $layoutProbeArgument, '--encoding', 'UTF-8', '--print-media-type', '--keep-relative-links', '--image-dpi', '300', "`"$TempFolder\section$($counter)_M.html`"" , "`"$output`""
  
   if ($counter -eq 1) { $script:firstArgs = $arggumen; $script:firstSeed = $counterSeed }
   Start-Process -NoNewWindow -Wait -FilePath $wkhtmltopdfPath   -ArgumentList $arggumen       -RedirectStandardError  (Join-Path $TempFolder "section$($counter)_M.log")
@@ -760,6 +770,26 @@ if ($tocHtml -and $tocEntries.Count -gt 0 -and $script:firstChunk) {
     }
     if (-not $hit) { $gi = $save }
   }
+  # Clickable PDF bookmarks: Ghostscript drops wkhtmltopdf's own outline on merge, so rebuild it with
+  # pdfmark (h2 with its h3 children), pointing at the pages computed above.
+  $bmLines = New-Object System.Collections.Generic.List[string]
+  $bmLines.Add('%!PS')
+  for ($bi = 0; $bi -lt $tocEntries.Count; $bi++) {
+    $bEntry = $tocEntries[$bi]
+    if (-not $bEntry.Page) { continue }
+    $bChildren = 0
+    if ($bEntry.Level -eq 2) {
+      for ($bj = $bi + 1; $bj -lt $tocEntries.Count -and $tocEntries[$bj].Level -ne 2; $bj++) {
+        if ($tocEntries[$bj].Level -eq 3 -and $tocEntries[$bj].Page) { $bChildren++ }
+      }
+    }
+    $bCount = if ($bChildren -gt 0) { "/Count $bChildren " } else { '' }
+    $bmLines.Add('[' + $bCount + '/Page ' + $bEntry.Page + ' /View [/XYZ null null null] /Title ' + (ConvertTo-PdfmarkText ($bEntry.Label + ' ' + $bEntry.Text)) + ' /OUT pdfmark')
+  }
+  if ($bmLines.Count -gt 1) {
+    $script:bookmarksPs = Join-Path $TempFolder 'bookmarks.ps'
+    Set-Content -LiteralPath $script:bookmarksPs -Value ($bmLines -join [Environment]::NewLine) -Encoding Ascii
+  }
   # Rebuild the first section with the numbered TOC after the cover, and re-render it in place.
   $tocFirst = $script:firstChunk
   $tocHe = $tocFirst.IndexOf('</header>', [System.StringComparison]::OrdinalIgnoreCase)
@@ -787,6 +817,7 @@ Get-ChildItem -Path $TempFolder  -Filter   "*.pdf" | ForEach-Object {
   $p = $p + ([int]$text)
 }
 
+if ($script:bookmarksPs -and (Test-Path $script:bookmarksPs)) { $arggumenFile += "-f"; $arggumenFile += "`"$script:bookmarksPs`"" }
 $arggumen = "-dBATCH", "-dNOPAUSE", "-sDEVICE=pdfwrite", "-dTotalPage=($($p))", "-dPDFSETTINGS=/prepress", "-sOutputFile=`"$outputPDFFinal`""
 $arggumen += $arggumenFile
 write-host $arggumen
